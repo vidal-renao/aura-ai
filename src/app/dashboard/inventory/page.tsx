@@ -9,6 +9,8 @@ import { getSessionContext } from '@/utils/auth/mockAuth';
 const supabase = createAuraClient();
 const DEMO_TENANT_ID = 'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d';
 
+type ChaosMode = 'timeout' | 'api_down' | 'corrupt';
+
 interface Product {
   id: string;
   sku: string;
@@ -46,6 +48,8 @@ export default function InventoryPage() {
     'Red corporativa estable. Sin incidencias de pasarela.'
   );
   const [isEdgeHealthy, setIsEdgeHealthy] = useState<boolean>(true);
+
+  const [activeChaosMode, setActiveChaosMode] = useState<ChaosMode | null>(null);
 
   const [flashingProductId, setFlashingProductId] = useState<string | null>(null);
   const [flashType, setFlashType] = useState<'up' | 'down'>('up');
@@ -100,7 +104,7 @@ export default function InventoryPage() {
     };
   }, []);
 
-  // WebSocket Realtime — estabilidad mediante refs
+  // WebSocket Realtime
   useEffect(() => {
     const productChannel = supabase
       .channel('realtime-inventory')
@@ -141,8 +145,54 @@ export default function InventoryPage() {
     };
   }, []);
 
+  // Lógica de polling compartida entre IA normal y Chaos Engineering
+  const startJobPolling = (jobId: string, chaosMode?: ChaosMode) => {
+    pollIntervalRef.current = setInterval(async () => {
+      const { data: job, error } = await supabase
+        .from('agent_jobs')
+        .select('*')
+        .eq('id', jobId)
+        .single();
+
+      if (error || !job) {
+        clearInterval(pollIntervalRef.current!);
+        pollIntervalRef.current = null;
+        setIsRunningAI(false);
+        setActiveChaosMode(null);
+        return;
+      }
+
+      setProgress(job.progress);
+      setAiStatusText(job.status_text);
+
+      if (job.status === 'completed') {
+        clearInterval(pollIntervalRef.current!);
+        pollIntervalRef.current = null;
+        setIsRunningAI(false);
+        setActiveChaosMode(null);
+        setProgress(0);
+        setTelemetryMessage(job.status_text);
+        if (!chaosMode) fetchInventoryAndLogs();
+      } else if (job.status === 'failed') {
+        clearInterval(pollIntervalRef.current!);
+        pollIntervalRef.current = null;
+        setIsRunningAI(false);
+        setActiveChaosMode(null);
+        setProgress(0);
+        setIsEdgeHealthy(false);
+        setTelemetryMessage(
+          job.error_message ||
+            (chaosMode
+              ? `[CHAOS:${chaosMode.toUpperCase()}] Fallo capturado en la canalización asíncrona.`
+              : 'Excepción capturada en la canalización.')
+        );
+      }
+    }, 800);
+  };
+
   const handleTriggerAI = async () => {
     setIsRunningAI(true);
+    setActiveChaosMode(null);
     setProgress(10);
     setAiStatusText('Creando tarea asíncrona en la red de borde...');
     setIsEdgeHealthy(true);
@@ -157,39 +207,7 @@ export default function InventoryPage() {
       const result = await response.json();
       if (!result.success) throw new Error(result.error);
 
-      pollIntervalRef.current = setInterval(async () => {
-        const { data: job, error } = await supabase
-          .from('agent_jobs')
-          .select('*')
-          .eq('id', result.job_id)
-          .single();
-
-        if (error || !job) {
-          clearInterval(pollIntervalRef.current!);
-          pollIntervalRef.current = null;
-          setIsRunningAI(false);
-          return;
-        }
-
-        setProgress(job.progress);
-        setAiStatusText(job.status_text);
-
-        if (job.status === 'completed') {
-          clearInterval(pollIntervalRef.current!);
-          pollIntervalRef.current = null;
-          setIsRunningAI(false);
-          setProgress(0);
-          setTelemetryMessage(job.status_text);
-          fetchInventoryAndLogs();
-        } else if (job.status === 'failed') {
-          clearInterval(pollIntervalRef.current!);
-          pollIntervalRef.current = null;
-          setIsRunningAI(false);
-          setProgress(0);
-          setIsEdgeHealthy(false);
-          setTelemetryMessage(job.error_message || 'Excepción capturada en la canalización.');
-        }
-      }, 800);
+      startJobPolling(result.job_id);
     } catch (err: any) {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
@@ -202,7 +220,39 @@ export default function InventoryPage() {
     }
   };
 
+  const handleTriggerChaos = async (mode: ChaosMode) => {
+    setIsRunningAI(true);
+    setActiveChaosMode(mode);
+    setProgress(10);
+    setAiStatusText(tChaos.running);
+    setIsEdgeHealthy(true);
+
+    try {
+      const response = await fetch('/api/aura/engine', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locale, chaos_mode: mode }),
+      });
+
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error);
+
+      startJobPolling(result.job_id, mode);
+    } catch (err: any) {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+      setIsRunningAI(false);
+      setActiveChaosMode(null);
+      setProgress(0);
+      setIsEdgeHealthy(false);
+      setTelemetryMessage(`[CHAOS:${mode.toUpperCase()}] Gateway fault: ${err.message}`);
+    }
+  };
+
   const t = dictionaries[locale].inventory;
+  const tChaos = dictionaries[locale].chaos;
 
   const totalCost = products.reduce((acc, p) => acc + p.cost_price * Math.max(p.stock_quantity, 1), 0);
   const currentRevenue = products.reduce((acc, p) => acc + p.current_price * Math.max(p.stock_quantity, 1), 0);
@@ -214,6 +264,33 @@ export default function InventoryPage() {
   const skippedCount = Math.max(0, products.length - anomalousCount);
   const tokensSaved = skippedCount * 450;
   const savingPct = products.length > 0 ? Math.round((skippedCount / products.length) * 100) : 0;
+
+  const chaosModeConfig: Record<ChaosMode, { label: string; color: string; activeBg: string; activeBorder: string; activeText: string; icon: string }> = {
+    timeout: {
+      label: tChaos.timeout,
+      color: 'amber',
+      activeBg: 'bg-amber-950',
+      activeBorder: 'border-amber-900',
+      activeText: 'text-amber-400',
+      icon: '⏱',
+    },
+    api_down: {
+      label: tChaos.api_down,
+      color: 'red',
+      activeBg: 'bg-red-950',
+      activeBorder: 'border-red-900',
+      activeText: 'text-red-400',
+      icon: '⚡',
+    },
+    corrupt: {
+      label: tChaos.corrupt,
+      color: 'orange',
+      activeBg: 'bg-orange-950',
+      activeBorder: 'border-orange-900',
+      activeText: 'text-orange-400',
+      icon: '☠',
+    },
+  };
 
   if (loading) {
     return (
@@ -260,7 +337,7 @@ export default function InventoryPage() {
                     : 'bg-[#deff9a] text-[#000000] border-[#deff9a] hover:bg-[#000000] hover:text-[#deff9a] shadow-[0_0_15px_rgba(222,255,154,0.15)]'
                 }`}
               >
-                {isRunningAI ? t.processing : t.trigger}
+                {isRunningAI && !activeChaosMode ? t.processing : t.trigger}
               </button>
             )}
 
@@ -268,12 +345,18 @@ export default function InventoryPage() {
               <div className="w-full md:w-72 space-y-1.5">
                 <div className="w-full bg-[#1a1a1a] h-2 rounded-full overflow-hidden border border-[#daffde]/10">
                   <div
-                    className="bg-[#deff9a] h-full transition-all duration-500 shadow-[0_0_10px_#deff9a]"
+                    className={`h-full transition-all duration-500 shadow-[0_0_10px] ${
+                      activeChaosMode
+                        ? 'bg-red-500 shadow-red-500/50'
+                        : 'bg-[#deff9a] shadow-[#deff9a]'
+                    }`}
                     style={{ width: `${progress}%` }}
                   />
                 </div>
                 <div className="flex justify-between text-[10px] font-mono text-[#daffde]/60">
-                  <span className="truncate max-w-[80%]">{aiStatusText}</span>
+                  <span className={`truncate max-w-[80%] ${activeChaosMode ? 'text-red-400/80' : ''}`}>
+                    {aiStatusText}
+                  </span>
                   <span>{progress}%</span>
                 </div>
               </div>
@@ -360,37 +443,142 @@ export default function InventoryPage() {
 
           {/* Tarjeta 3: Edge Node Monitoring */}
           <div
-            className={`p-6 rounded-xl border flex flex-col justify-between shadow-xl transition-all duration-300 ${
-              isEdgeHealthy ? 'bg-[#111111] border-blue-900/20' : 'bg-[#1a0a0a] border-red-900/40'
+            className={`p-6 rounded-xl border flex flex-col justify-between shadow-xl transition-all duration-500 ${
+              isEdgeHealthy
+                ? 'bg-[#111111] border-blue-900/20'
+                : 'bg-[#1a0808] border-red-900/50 shadow-[0_0_30px_rgba(239,68,68,0.08)]'
             }`}
           >
             <div>
               <div className="flex justify-between items-center">
                 <h3 className="text-base font-bold text-[#f5f5f5]">Edge Node Monitoring</h3>
                 <span
-                  className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-bold uppercase flex items-center gap-1 ${
+                  className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-bold uppercase flex items-center gap-1 transition-all duration-300 ${
                     isEdgeHealthy
                       ? 'bg-blue-950 text-blue-400 border border-blue-900'
                       : 'bg-red-950 text-red-400 border border-red-900'
                   }`}
                 >
                   <span
-                    className={`w-1 h-1 rounded-full ${
-                      isEdgeHealthy ? 'bg-blue-400 animate-pulse' : 'bg-red-400'
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      isEdgeHealthy ? 'bg-blue-400 animate-pulse' : 'bg-red-400 animate-ping'
                     }`}
                   />
                   {isEdgeHealthy ? 'HEALTHY' : 'INCIDENT'}
                 </span>
               </div>
-              <p className="text-[11px] font-mono text-[#daffde]/40 mt-2 leading-normal line-clamp-3">
+
+              {!isEdgeHealthy && (
+                <div className="mt-2 px-2 py-1 bg-red-950/40 border border-red-900/30 rounded text-[9px] font-mono text-red-400/70 uppercase tracking-wider">
+                  {locale === 'de'
+                    ? 'Pipeline-Fehler erfasst'
+                    : locale === 'en'
+                    ? 'Pipeline fault captured'
+                    : 'Fallo de pipeline capturado'}
+                </div>
+              )}
+
+              <p
+                className={`text-[11px] font-mono mt-2 leading-normal line-clamp-4 transition-colors duration-300 ${
+                  isEdgeHealthy ? 'text-[#daffde]/40' : 'text-red-400/80'
+                }`}
+              >
                 {telemetryMessage}
               </p>
             </div>
-            <div className="flex justify-between text-[10px] font-mono text-[#daffde]/30 pt-3 border-t border-[#daffde]/5 mt-3">
-              <span>Gateway: HTTP/3 v2</span>
-              <span>Región: fra1 (DACH)</span>
+            <div className="flex justify-between text-[10px] font-mono text-[#daffde]/25 pt-3 border-t border-[#daffde]/5 mt-3">
+              <span>{tChaos.edgeGateway}</span>
+              <span>{tChaos.edgeRegion}</span>
             </div>
           </div>
+        </div>
+
+        {/* ☣️ Chaos Engineering Lab */}
+        <div
+          className={`rounded-xl border p-6 shadow-xl transition-all duration-300 ${
+            activeChaosMode && isRunningAI
+              ? 'bg-[#120808] border-red-900/60 shadow-[0_0_40px_rgba(239,68,68,0.06)]'
+              : 'bg-[#0d0808] border-red-900/20'
+          }`}
+        >
+          {/* Header */}
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div className="flex items-center gap-3">
+              <div
+                className={`w-2 h-2 rounded-full ${
+                  activeChaosMode && isRunningAI ? 'bg-red-500 animate-ping' : 'bg-red-800'
+                }`}
+              />
+              <h3 className="text-base font-bold text-[#f5f5f5]">{tChaos.title}</h3>
+              <span className="text-[9px] font-mono bg-red-950/60 text-red-400 border border-red-900/60 px-1.5 py-0.5 rounded uppercase font-bold tracking-wider">
+                {tChaos.warning}
+              </span>
+            </div>
+            <span className="text-[9px] font-mono text-[#daffde]/15 tracking-widest uppercase">
+              chaos-monkey · v1.0 · aura-infra
+            </span>
+          </div>
+
+          <p className="text-[11px] font-mono text-[#daffde]/30 mb-5 leading-relaxed max-w-2xl">
+            {tChaos.subtitle}
+          </p>
+
+          {!isAdmin ? (
+            <div className="flex items-center gap-2 text-xs font-mono text-amber-400/60 border border-amber-900/30 bg-amber-950/20 px-4 py-3 rounded-lg">
+              <span>🔒</span>
+              <span>{tChaos.adminOnly}</span>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-3">
+              {(Object.keys(chaosModeConfig) as ChaosMode[]).map((mode) => {
+                const cfg = chaosModeConfig[mode];
+                const isThisActive = activeChaosMode === mode && isRunningAI;
+                const isDisabled = isRunningAI;
+
+                return (
+                  <button
+                    key={mode}
+                    onClick={() => handleTriggerChaos(mode)}
+                    disabled={isDisabled}
+                    className={`px-4 py-2.5 rounded-lg text-xs font-mono font-bold uppercase tracking-wider border transition-all duration-200 flex items-center gap-2 ${
+                      isThisActive
+                        ? `${cfg.activeBg} ${cfg.activeText} ${cfg.activeBorder} animate-pulse`
+                        : isDisabled
+                        ? 'opacity-30 cursor-not-allowed bg-[#1a1a1a] border-[#daffde]/5 text-[#daffde]/20'
+                        : cfg.color === 'amber'
+                        ? 'border-amber-900/50 text-amber-400/80 bg-amber-950/20 hover:bg-amber-950/60 hover:border-amber-800 hover:text-amber-300'
+                        : cfg.color === 'red'
+                        ? 'border-red-900/50 text-red-400/80 bg-red-950/20 hover:bg-red-950/60 hover:border-red-800 hover:text-red-300'
+                        : 'border-orange-900/50 text-orange-400/80 bg-orange-950/20 hover:bg-orange-950/60 hover:border-orange-800 hover:text-orange-300'
+                    }`}
+                  >
+                    <span>{cfg.icon}</span>
+                    <span>{cfg.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Indicador de modo activo */}
+          {activeChaosMode && isRunningAI && (
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2 text-[11px] font-mono">
+                <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
+                <span className="text-red-400/80">{tChaos.running}</span>
+              </div>
+              <span className="text-[10px] font-mono text-[#daffde]/20">
+                {tChaos.modeLabel}:
+              </span>
+              <span
+                className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
+                  chaosModeConfig[activeChaosMode].activeBg
+                } ${chaosModeConfig[activeChaosMode].activeText} ${chaosModeConfig[activeChaosMode].activeBorder}`}
+              >
+                {activeChaosMode.toUpperCase()}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Tabla de Catálogo Reactivo */}
@@ -462,7 +650,7 @@ export default function InventoryPage() {
           </table>
         </div>
 
-        {/* Audit Trail — Historial de Elasticidad Financiera */}
+        {/* Audit Trail */}
         <div className="space-y-4">
           <div>
             <h2 className="text-2xl font-bold tracking-tight text-[#f5f5f5]">{t.historyTitle}</h2>

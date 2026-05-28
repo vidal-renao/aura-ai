@@ -10,6 +10,7 @@ const anthropic = new Anthropic({
 
 const RequestSchema = z.object({
   locale: z.enum(['es', 'de', 'en']).optional().default('es'),
+  chaos_mode: z.enum(['timeout', 'api_down', 'corrupt']).optional(),
 });
 
 export async function POST(req: Request) {
@@ -27,14 +28,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Parámetros i18n inválidos' }, { status: 400 });
     }
 
-    const { locale } = parseCheck.data;
+    const { locale, chaos_mode } = parseCheck.data;
+
+    const initStatusText = chaos_mode
+      ? `[CHAOS:${chaos_mode.toUpperCase()}] Inicializando inyección de fallo controlado en pipeline...`
+      : 'Iniciando pipeline asíncrono seguro en la red de borde...';
 
     const { data: job, error: jobErr } = await supabase
       .from('agent_jobs')
       .insert({
         tenant_id,
         status: 'processing',
-        status_text: 'Iniciando pipeline asíncrono seguro en la red de borde...',
+        status_text: initStatusText,
         progress: 10,
       })
       .select('*')
@@ -45,13 +50,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Fallo crítico de inicialización DevOps' }, { status: 500 });
     }
 
-    // Hilo analítico asíncrono con observabilidad LLM nativa
+    // Hilo analítico asíncrono con observabilidad LLM nativa y soporte Chaos Engineering
     (async () => {
       const jobId = job.id;
       try {
-        // 🔍 FILTRO PRE-ALGORÍTMICO FINOPS: extrae todo el catálogo y filtra anomalías en memoria
-        // PostgREST no soporta comparación cross-column en .or(), por lo que el filtro semántico
-        // se aplica server-side tras el fetch completo — garantía de correctitud sin dependencias extra.
+        // 🔍 FILTRO PRE-ALGORÍTMICO FINOPS
         const { data: allProducts, count: totalCount, error: prodErr } = await supabase
           .from('products')
           .select('*', { count: 'exact' })
@@ -81,10 +84,50 @@ export async function POST(req: Request) {
         await supabase
           .from('agent_jobs')
           .update({
-            status_text: `FinOps: Analizando ${analyzedSKUs}/${totalSKUs} SKUs. Ahorro: ~${tokensSaved.toLocaleString()} tokens.`,
+            status_text: chaos_mode
+              ? `[CHAOS:${chaos_mode.toUpperCase()}] Catálogo cargado. Desviando pipeline hacia simulador de fallos...`
+              : `FinOps: Analizando ${analyzedSKUs}/${totalSKUs} SKUs. Ahorro: ~${tokensSaved.toLocaleString()} tokens.`,
             progress: 40,
           })
           .eq('id', jobId);
+
+        // ☣️ CHAOS ENGINEERING — Desvío controlado del pipeline LLM
+        // Si chaos_mode está activo, se omite la llamada a Anthropic y se simula el fallo
+        // a nivel de bytes/protocolo para validar resiliencia del sistema de observabilidad.
+        if (chaos_mode) {
+          await supabase
+            .from('agent_jobs')
+            .update({
+              status_text: `[CHAOS:${chaos_mode.toUpperCase()}] Interceptando capa LLM — simulando fallo en canalización asíncrona...`,
+              progress: 70,
+            })
+            .eq('id', jobId);
+
+          if (chaos_mode === 'timeout') {
+            // Bloquear el worker 20s para simular timeout de pasarela
+            await new Promise((r) => setTimeout(r, 20_000));
+            throw new Error(
+              `[CHAOS:TIMEOUT] Límite de pasarela superado: 20,000ms sin respuesta de Anthropic. ` +
+              `La solicitud fue abortada en el nodo de borde fra1. ` +
+              `Latencia acumulada: ${((Date.now() - startTime) / 1000).toFixed(2)}s`
+            );
+          }
+
+          if (chaos_mode === 'api_down') {
+            throw new Error(
+              `[CHAOS:API_DOWN] HTTP 503 Service Unavailable — Anthropic API no disponible. ` +
+              `El nodo de borde recibió código de error PROVIDER_DOWN en la capa de transporte. ` +
+              `Pipeline interrumpido en invocación LLM. Retry-After: 60s`
+            );
+          }
+
+          if (chaos_mode === 'corrupt') {
+            // SyntaxError intencional: JSON truncado simula respuesta corrupta del modelo
+            const malformedPayload =
+              `{"insights":[{"sku":"${anomalousProducts[0]?.sku ?? 'UNKNOWN'}","insight_type":"dynamic_pricing","proposed_data":{"suggested_price":`;
+            JSON.parse(malformedPayload);
+          }
+        }
 
         if (anomalousProducts.length === 0) {
           await supabase
@@ -182,7 +225,6 @@ export async function POST(req: Request) {
 
         const latencyLLM = Date.now() - apiCallStart;
 
-        // 🛡️ TOLERANCIA A FALLOS: validar respuesta estructurada de Claude
         const toolBlock = response.content.find((block) => block.type === 'tool_use');
         if (!toolBlock || typeof toolBlock.input !== 'object') {
           throw new Error(
@@ -225,13 +267,20 @@ export async function POST(req: Request) {
           })
           .eq('id', jobId);
       } catch (innerError: any) {
-        console.error('⚠️ [OBSERVABILIDAD LLM] Error en segundo plano:', innerError.message);
+        const isChaos = innerError.message?.startsWith('[CHAOS:');
+        console.error(
+          isChaos ? '☣️ [CHAOS ENGINEERING]' : '⚠️ [OBSERVABILIDAD LLM]',
+          'Error en segundo plano:',
+          innerError.message
+        );
         await supabase
           .from('agent_jobs')
           .update({
             status: 'failed',
-            status_text: 'Fallo en la canalización analítica de la IA.',
-            error_message: `Excepción capturada: ${innerError.message} | Latencia total: ${((Date.now() - startTime) / 1000).toFixed(2)}s`,
+            status_text: isChaos
+              ? `Fallo controlado inyectado. Resiliencia del pipeline validada.`
+              : 'Fallo en la canalización analítica de la IA.',
+            error_message: `${innerError.message} | Latencia total: ${((Date.now() - startTime) / 1000).toFixed(2)}s`,
             progress: 100,
           })
           .eq('id', jobId);
