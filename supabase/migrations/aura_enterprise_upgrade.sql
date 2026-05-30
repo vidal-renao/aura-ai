@@ -70,10 +70,10 @@ CREATE INDEX IF NOT EXISTS idx_sales_history_product_date ON aura_core.sales_his
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_tenant_status ON aura_core.agent_jobs(tenant_id, status);
 
 -- ----------------------------------------------------------------
--- STEP 6: Disable RLS on new tables (service_role pattern)
+-- STEP 6: Enable RLS on new tables — policies applied in aura_security_blindage.sql
 -- ----------------------------------------------------------------
-ALTER TABLE aura_core.sales_history DISABLE ROW LEVEL SECURITY;
-ALTER TABLE aura_core.agent_jobs DISABLE ROW LEVEL SECURITY;
+ALTER TABLE aura_core.sales_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE aura_core.agent_jobs ENABLE ROW LEVEL SECURITY;
 
 -- ----------------------------------------------------------------
 -- STEP 7: Grants (cumulative — safe to re-run)

@@ -145,16 +145,38 @@ export default function InventoryPage() {
     };
   }, []);
 
-  // Lógica de polling compartida entre IA normal y Chaos Engineering
+  // Lógica de polling compartida entre IA normal y Chaos Engineering.
+  // Usa el endpoint de servidor /api/aura/jobs/[jobId] (service_role) para evitar
+  // bloqueos por RLS: el cliente browser (anon) no tiene JWT con tenant_id claim.
   const startJobPolling = (jobId: string, chaosMode?: ChaosMode) => {
     pollIntervalRef.current = setInterval(async () => {
-      const { data: job, error } = await supabase
-        .from('agent_jobs')
-        .select('*')
-        .eq('id', jobId)
-        .single();
+      let job: { status: string; progress: number; status_text: string; error_message?: string } | null = null;
 
-      if (error || !job) {
+      try {
+        const res = await fetch(`/api/aura/jobs/${jobId}`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!res.ok) {
+          clearInterval(pollIntervalRef.current!);
+          pollIntervalRef.current = null;
+          setIsRunningAI(false);
+          setActiveChaosMode(null);
+          return;
+        }
+
+        const payload = await res.json();
+        job = payload.job ?? null;
+      } catch {
+        clearInterval(pollIntervalRef.current!);
+        pollIntervalRef.current = null;
+        setIsRunningAI(false);
+        setActiveChaosMode(null);
+        return;
+      }
+
+      if (!job) {
         clearInterval(pollIntervalRef.current!);
         pollIntervalRef.current = null;
         setIsRunningAI(false);
