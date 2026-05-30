@@ -19,7 +19,7 @@ export async function POST(req: Request) {
 
   try {
     const userSession = getSessionContext();
-    const tenant_id = userSession.tenant_id;
+    const tenant_id = userSession.app_metadata.tenant_id;
 
     const body = await req.json();
     const parseCheck = RequestSchema.safeParse(body);

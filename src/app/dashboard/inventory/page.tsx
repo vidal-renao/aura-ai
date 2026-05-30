@@ -7,7 +7,6 @@ import { dictionaries, Locale } from '@/utils/i18n/dictionaries';
 import { getSessionContext } from '@/utils/auth/mockAuth';
 
 const supabase = createAuraClient();
-const DEMO_TENANT_ID = 'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d';
 
 type ChaosMode = 'timeout' | 'api_down' | 'corrupt';
 
@@ -62,10 +61,11 @@ export default function InventoryPage() {
   }, [products]);
 
   const fetchInventoryAndLogs = async () => {
+    const { app_metadata: { tenant_id } } = getSessionContext();
     const { data: prodData } = await supabase
       .from('products')
       .select('*')
-      .eq('tenant_id', DEMO_TENANT_ID);
+      .eq('tenant_id', tenant_id);
 
     if (prodData) setProducts(prodData);
 
@@ -106,6 +106,7 @@ export default function InventoryPage() {
 
   // WebSocket Realtime
   useEffect(() => {
+    const { app_metadata: { tenant_id } } = getSessionContext();
     const productChannel = supabase
       .channel('realtime-inventory')
       .on(
@@ -114,7 +115,7 @@ export default function InventoryPage() {
           event: 'UPDATE',
           schema: 'aura_core',
           table: 'products',
-          filter: `tenant_id=eq.${DEMO_TENANT_ID}`,
+          filter: `tenant_id=eq.${tenant_id}`,
         },
         (payload) => {
           const oldProd = productsRef.current.find((p) => p.id === payload.new.id);

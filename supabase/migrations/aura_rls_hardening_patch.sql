@@ -34,10 +34,12 @@ DROP POLICY IF EXISTS sales_isolation_policy  ON aura_core.sales_history;
 -- service_role bypasses RLS by design and is the only writer
 -- (via createAuraServerClient on the server side).
 -- ----------------------------------------------------------------
+-- app_metadata is server-controlled (service_role only) and cannot be
+-- modified by end users, unlike user_metadata which is user-editable.
 CREATE POLICY jobs_select_policy ON aura_core.agent_jobs
     FOR SELECT
     TO authenticated
-    USING (tenant_id = (auth.jwt() ->> 'tenant_id')::uuid);
+    USING (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid);
 
 -- ----------------------------------------------------------------
 -- STEP 4: sales_history — join-scoped multi-tenant READ isolation
@@ -50,7 +52,7 @@ CREATE POLICY sales_select_policy ON aura_core.sales_history
     USING (
         product_id IN (
             SELECT id FROM aura_core.products
-            WHERE tenant_id = (auth.jwt() ->> 'tenant_id')::uuid
+            WHERE tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid
         )
     );
 

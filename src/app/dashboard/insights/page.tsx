@@ -7,7 +7,6 @@ import { dictionaries, Locale } from '@/utils/i18n/dictionaries';
 import { getSessionContext } from '@/utils/auth/mockAuth';
 
 const supabase = createAuraClient();
-const DEMO_TENANT_ID = 'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d';
 
 interface AIInsight {
   id: string;
@@ -61,13 +60,14 @@ export default function InsightsPage() {
 
   const fetchInsights = async () => {
     setLoading(true);
+    const { app_metadata: { tenant_id } } = getSessionContext();
     const { data, error } = await supabase
       .from('ai_insights')
       .select(`
         id, insight_type, status, headline, justification, proposed_data, created_at,
         products ( id, title, current_price, sku, stock_quantity )
       `)
-      .eq('tenant_id', DEMO_TENANT_ID)
+      .eq('tenant_id', tenant_id)
       .eq('status', 'pending')
       .order('created_at', { ascending: false });
 

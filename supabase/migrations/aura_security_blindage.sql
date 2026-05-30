@@ -31,21 +31,21 @@ DROP POLICY IF EXISTS sales_select_policy      ON aura_core.sales_history;
 CREATE POLICY tenant_isolation_policy ON aura_core.tenants
     FOR SELECT
     TO authenticated
-    USING (id = (auth.jwt() ->> 'tenant_id')::uuid);
+    USING (id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid);
 
 -- Tabla: products — lectura y escritura acotada al tenant del JWT
 CREATE POLICY product_isolation_policy ON aura_core.products
     FOR ALL
     TO authenticated
-    USING (tenant_id = (auth.jwt() ->> 'tenant_id')::uuid)
-    WITH CHECK (tenant_id = (auth.jwt() ->> 'tenant_id')::uuid);
+    USING (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid)
+    WITH CHECK (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid);
 
 -- Tabla: ai_insights — bandeja de sugerencias del agente, scoped al tenant del JWT
 CREATE POLICY insights_isolation_policy ON aura_core.ai_insights
     FOR ALL
     TO authenticated
-    USING (tenant_id = (auth.jwt() ->> 'tenant_id')::uuid)
-    WITH CHECK (tenant_id = (auth.jwt() ->> 'tenant_id')::uuid);
+    USING (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid)
+    WITH CHECK (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid);
 
 -- Tabla: pricing_logs — el frontend autenticado puede insertar y leer logs
 -- La clave es que el product_id pertenezca a un producto del tenant del JWT
@@ -55,13 +55,13 @@ CREATE POLICY logs_isolation_policy ON aura_core.pricing_logs
     USING (
         product_id IN (
             SELECT id FROM aura_core.products
-            WHERE tenant_id = (auth.jwt() ->> 'tenant_id')::uuid
+            WHERE tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid
         )
     )
     WITH CHECK (
         product_id IN (
             SELECT id FROM aura_core.products
-            WHERE tenant_id = (auth.jwt() ->> 'tenant_id')::uuid
+            WHERE tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid
         )
     );
 
@@ -72,7 +72,7 @@ CREATE POLICY sales_select_policy ON aura_core.sales_history
     USING (
         product_id IN (
             SELECT id FROM aura_core.products
-            WHERE tenant_id = (auth.jwt() ->> 'tenant_id')::uuid
+            WHERE tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid
         )
     );
 
@@ -81,7 +81,7 @@ CREATE POLICY sales_select_policy ON aura_core.sales_history
 CREATE POLICY jobs_select_policy ON aura_core.agent_jobs
     FOR SELECT
     TO authenticated
-    USING (tenant_id = (auth.jwt() ->> 'tenant_id')::uuid);
+    USING (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid);
 
 -- ====================================================================
 -- GOBERNANZA DE PRIVILEGIOS — REVOCAR ACCESO DE ESCRITURA A ROLES PÚBLICOS
