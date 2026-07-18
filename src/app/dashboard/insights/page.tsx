@@ -1,10 +1,10 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { createAuraClient } from '@/utils/supabase/client';
+import { useEffect, useState } from 'react';
 import Navigation from '@/components/Navigation';
-import { dictionaries, Locale } from '@/utils/i18n/dictionaries';
-import { getSessionContext } from '@/utils/auth/mockAuth';
+import { createAuraClient } from '@/utils/supabase/client';
+import { getClientSessionContext } from '@/utils/auth/client';
+import { dictionaries, type Locale } from '@/utils/i18n/dictionaries';
 
 const supabase = createAuraClient();
 
@@ -14,348 +14,150 @@ interface AIInsight {
   status: string;
   headline: string;
   justification: string;
-  proposed_data: {
-    suggested_price: number | null;
-    seo_title: string | null;
-    seo_description: string | null;
-  };
+  proposed_data: { suggested_price: number | null; seo_title: string | null; seo_description: string | null };
   created_at: string;
-  products: {
-    id: string;
-    title: string;
-    current_price: number;
-    sku: string;
-    stock_quantity: number;
-  };
+  products: { id: string; title: string; current_price: number; sku: string; stock_quantity: number };
 }
 
+type DecisionBody = { action: 'apply'; restock_quantity?: number } | { action: 'dismiss' };
+
+async function submitDecision(insightId: string, body: DecisionBody) {
+  const response = await fetch(`/api/aura/insights/${insightId}/decision`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const payload: { error?: string } = await response.json();
+  if (!response.ok) throw new Error(payload.error ?? 'No se pudo procesar la decisión.');
+}
+
+const typeMeta: Record<string, { label: string; color: string; mark: string }> = {
+  dynamic_pricing: { label: 'Precio', color: 'var(--cobalt)', mark: '↗' },
+  stock_risk: { label: 'Stock', color: 'var(--signal)', mark: '!' },
+  seo_optimization: { label: 'SEO', color: 'var(--pine)', mark: 'Aa' },
+};
+
 export default function InsightsPage() {
-  const [locale, setLocale] = useState<Locale>('es');
-  const [isAdmin, setIsAdmin] = useState<boolean>(() => getSessionContext().role === 'Admin');
+  const [locale, setLocale] = useState<Locale>(() => typeof window === 'undefined' ? 'es' : (localStorage.getItem('aura_locale') as Locale) || 'es');
+  const [isAdmin, setIsAdmin] = useState(false);
   const [insights, setInsights] = useState<AIInsight[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState(true);
   const [actioningId, setActioningId] = useState<string | null>(null);
   const [restockModal, setRestockModal] = useState<{ insight: AIInsight; qty: string } | null>(null);
 
   useEffect(() => {
-    const savedLocale = localStorage.getItem('aura_locale') as Locale;
-    if (savedLocale) setLocale(savedLocale);
-
-    const handleLocaleChange = () => {
-      const newLocale = localStorage.getItem('aura_locale') as Locale;
-      if (newLocale) setLocale(newLocale);
-    };
-
-    window.addEventListener('localeChange', handleLocaleChange);
-    return () => window.removeEventListener('localeChange', handleLocaleChange);
+    const change = () => setLocale((localStorage.getItem('aura_locale') as Locale) || 'es');
+    window.addEventListener('localeChange', change);
+    return () => window.removeEventListener('localeChange', change);
   }, []);
 
-  useEffect(() => {
-    const handleRoleChange = () => {
-      setIsAdmin(getSessionContext().role === 'Admin');
-    };
-    window.addEventListener('roleChange', handleRoleChange);
-    return () => window.removeEventListener('roleChange', handleRoleChange);
-  }, []);
+  useEffect(() => { getClientSessionContext().then((context) => setIsAdmin(context.role === 'Admin')); }, []);
 
   const fetchInsights = async () => {
-    setLoading(true);
-    const { app_metadata: { tenant_id } } = getSessionContext();
-    const { data, error } = await supabase
-      .from('ai_insights')
-      .select(`
-        id, insight_type, status, headline, justification, proposed_data, created_at,
-        products ( id, title, current_price, sku, stock_quantity )
-      `)
-      .eq('tenant_id', tenant_id)
-      .eq('status', 'pending')
-      .order('created_at', { ascending: false });
-
-    if (error) console.error('Error recuperando auditorías de IA:', error);
-    else setInsights((data as any) || []);
+    const { tenantId } = await getClientSessionContext();
+    const { data, error } = await supabase.from('ai_insights').select(`
+      id, insight_type, status, headline, justification, proposed_data, created_at,
+      products ( id, title, current_price, sku, stock_quantity )
+    `).eq('tenant_id', tenantId).eq('status', 'pending').order('created_at', { ascending: false });
+    if (!error) setInsights((data as unknown as AIInsight[]) || []);
     setLoading(false);
   };
 
-  useEffect(() => {
-    fetchInsights();
-  }, []);
+  useEffect(() => { queueMicrotask(() => void fetchInsights()); }, []);
 
-  const handleRestockConfirm = async () => {
-    if (!restockModal) return;
-    const { insight, qty } = restockModal;
-    const units = parseInt(qty, 10);
-    if (isNaN(units) || units <= 0) return;
-
-    setRestockModal(null);
-    setActioningId(insight.id);
-    try {
-      const { error: stockErr } = await supabase
-        .from('products')
-        .update({ stock_quantity: insight.products.stock_quantity + units })
-        .eq('id', insight.products.id);
-
-      if (stockErr) throw new Error(`[products.update] ${stockErr.message} (${stockErr.code})`);
-
-      const { error: insightErr } = await supabase
-        .from('ai_insights')
-        .update({ status: 'applied' })
-        .eq('id', insight.id);
-
-      if (insightErr) throw new Error(`[ai_insights.update] ${insightErr.message} (${insightErr.code})`);
-
-      setInsights((prev) => prev.filter((item) => item.id !== insight.id));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : JSON.stringify(err);
-      alert(`Error al reponer stock.\n\n${msg}`);
-    } finally {
-      setActioningId(null);
-    }
-  };
-
-  const handleApprove = async (insight: AIInsight) => {
-    if (insight.insight_type === 'stock_risk') {
+  const decide = async (insight: AIInsight, action: 'apply' | 'dismiss') => {
+    if (action === 'apply' && insight.insight_type === 'stock_risk') {
       setRestockModal({ insight, qty: '' });
       return;
     }
     setActioningId(insight.id);
     try {
-      if (insight.insight_type === 'dynamic_pricing' && insight.proposed_data.suggested_price) {
-        const { error: updateProdErr } = await supabase
-          .from('products')
-          .update({ current_price: insight.proposed_data.suggested_price })
-          .eq('id', insight.products.id);
-
-        if (updateProdErr) {
-          console.error('[Step 1] Product update failed:', updateProdErr.message, updateProdErr.code, updateProdErr.details);
-          throw new Error(`[products.update] ${updateProdErr.message} (${updateProdErr.code})`);
-        }
-
-        const userSession = getSessionContext();
-        const { error: logErr } = await supabase
-          .from('pricing_logs')
-          .insert({
-            product_id: insight.products.id,
-            old_price: insight.products.current_price,
-            new_price: insight.proposed_data.suggested_price,
-            reason: insight.headline,
-            executed_by_email: userSession.email,
-            executed_by_role: userSession.role,
-          });
-
-        if (logErr) {
-          console.error('[Step 2] Pricing log insert failed:', logErr.message, logErr.code, logErr.details);
-          throw new Error(`[pricing_logs.insert] ${logErr.message} (${logErr.code})`);
-        }
-      }
-
-      const { error: updateInsightErr } = await supabase
-        .from('ai_insights')
-        .update({ status: 'applied' })
-        .eq('id', insight.id);
-
-      if (updateInsightErr) {
-        console.error('[Step 3] Insight status update failed:', updateInsightErr.message, updateInsightErr.code, updateInsightErr.details);
-        throw new Error(`[ai_insights.update] ${updateInsightErr.message} (${updateInsightErr.code})`);
-      }
-
-      setInsights((prev) => prev.filter((item) => item.id !== insight.id));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : JSON.stringify(err);
-      console.error('Error al procesar la aprobación:', msg);
-      alert(`Error de infraestructura al aplicar el cambio.\n\n${msg}`);
-    } finally {
-      setActioningId(null);
-    }
+      await submitDecision(insight.id, { action });
+      setInsights((current) => current.filter((item) => item.id !== insight.id));
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'No se pudo procesar la decisión.');
+    } finally { setActioningId(null); }
   };
 
-  const handleDismiss = async (id: string) => {
-    setActioningId(id);
-    const { error } = await supabase
-      .from('ai_insights')
-      .update({ status: 'dismissed' })
-      .eq('id', id);
-
-    if (!error) setInsights((prev) => prev.filter((item) => item.id !== id));
-    setActioningId(null);
+  const confirmRestock = async () => {
+    if (!restockModal) return;
+    const units = Number.parseInt(restockModal.qty, 10);
+    if (!Number.isInteger(units) || units <= 0) return;
+    const insight = restockModal.insight;
+    setRestockModal(null);
+    setActioningId(insight.id);
+    try {
+      await submitDecision(insight.id, { action: 'apply', restock_quantity: units });
+      setInsights((current) => current.filter((item) => item.id !== insight.id));
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'No se pudo actualizar el stock.');
+    } finally { setActioningId(null); }
   };
 
   const t = dictionaries[locale].insights;
 
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-[#000000] text-[#f5f5f5] flex items-center justify-center font-sans">
-        <p className="text-[#deff9a] text-xl animate-pulse tracking-wide">{t.loading}</p>
-      </div>
-    );
-  }
-
   return (
-    <div className="min-h-screen bg-[#000000] text-[#f5f5f5] font-sans">
+    <div className="aura-page">
       <Navigation />
+      <main className="aura-wrap py-10 md:py-16">
+        <header className="grid md:grid-cols-[1fr_auto] gap-8 items-end border-b border-[var(--ink)] pb-8 aura-enter">
+          <div>
+            <p className="aura-label text-[var(--cobalt)]">Decision inbox · {insights.length} pendientes</p>
+            <h1 className="aura-display text-5xl md:text-7xl mt-4">Tu criterio,<br /><em>en el circuito.</em></h1>
+          </div>
+          <p className="text-sm text-[var(--muted)] max-w-sm leading-relaxed">{t.sub}</p>
+        </header>
 
-      <div className="max-w-5xl mx-auto p-8 space-y-8">
-        <div className="border-b border-[#daffde]/20 pb-6">
-          <h1 className="text-4xl font-black tracking-tight text-[#f5f5f5]">
-            {t.title} <span className="text-[#deff9a]">{t.span}</span>
-          </h1>
-          <p className="text-[#daffde]/70 text-sm mt-1">{t.sub}</p>
-        </div>
-
-        <div className="space-y-6">
-          {insights.length === 0 ? (
-            <div className="border border-dashed border-[#daffde]/20 rounded-xl p-12 text-center bg-[#1a1a1a]/30">
-              <p className="text-[#daffde]/60 text-lg">{t.noInsights}</p>
-            </div>
-          ) : (
-            insights.map((insight) => (
-              <div
-                key={insight.id}
-                className="bg-[#1a1a1a] rounded-xl border border-[#daffde]/10 p-6 flex flex-col gap-6 hover:border-[#daffde]/30 transition-all"
-              >
-                <div className="flex flex-col md:flex-row justify-between items-start gap-4">
-                  <div className="space-y-2 max-w-3xl">
-                    <span
-                      className={`inline-block px-2.5 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider ${
-                        insight.insight_type === 'dynamic_pricing'
-                          ? 'bg-[#deff9a]/10 text-[#deff9a] border border-[#deff9a]/20'
-                          : insight.insight_type === 'stock_risk'
-                          ? 'bg-red-950 text-red-400 border border-red-900'
-                          : 'bg-blue-950 text-blue-400 border border-blue-900'
-                      }`}
-                    >
-                      {insight.insight_type.replace(/_/g, ' ')}
-                    </span>
-                    <h3 className="text-xl font-bold text-[#f5f5f5]">{insight.headline}</h3>
-                    <p className="text-[#f5f5f5]/70 text-sm leading-relaxed">
-                      {insight.justification}
-                    </p>
+        {loading ? (
+          <section className="py-24 text-center"><span className="aura-label text-[var(--cobalt)] animate-pulse">Leyendo propuestas…</span></section>
+        ) : insights.length === 0 ? (
+          <section className="aura-panel mt-10 p-10 md:p-16 text-center aura-data-grid">
+            <div className="w-14 h-14 rounded-full border border-[var(--pine)] text-[var(--pine)] grid place-items-center mx-auto text-2xl">✓</div>
+            <h2 className="font-serif text-3xl mt-6">No hay decisiones pendientes</h2>
+            <p className="text-[var(--muted)] mt-3">Ejecuta un nuevo análisis desde Catálogo cuando cambien precios o existencias.</p>
+          </section>
+        ) : (
+          <section className="mt-10 space-y-4">
+            {insights.map((insight, index) => {
+              const meta = typeMeta[insight.insight_type] ?? typeMeta.seo_optimization;
+              return (
+                <article key={insight.id} className="aura-panel overflow-hidden grid lg:grid-cols-[72px_1fr_280px] aura-enter" style={{ animationDelay: `${index * 60}ms` }}>
+                  <div className="p-5 lg:p-0 lg:border-r border-[var(--line)] flex lg:flex-col items-center justify-between lg:justify-center gap-3" style={{ color: meta.color }}>
+                    <span className="font-serif text-3xl">{meta.mark}</span><span className="aura-label">{meta.label}</span>
                   </div>
-
-                  {insight.insight_type === 'dynamic_pricing' && (
-                    <div className="text-right min-w-37.5 bg-[#0a0a0a] p-4 rounded-lg border border-[#daffde]/5 shrink-0">
-                      <p className="text-[10px] font-mono text-[#daffde]/40 uppercase tracking-widest">
-                        {t.suggested}
-                      </p>
-                      <p className="text-2xl font-mono font-bold text-[#deff9a] mt-1">
-                        {insight.proposed_data.suggested_price?.toFixed(2)} CHF
-                      </p>
-                      <p className="text-xs line-through text-[#f5f5f5]/40 font-mono mt-1">
-                        Act: {insight.products?.current_price?.toFixed(2)}
-                      </p>
+                  <div className="p-6 md:p-8">
+                    <div className="flex flex-wrap items-center gap-3 text-xs text-[var(--muted)] mb-4">
+                      <span className="font-mono font-bold text-[var(--ink)]">{insight.products.sku}</span><span>·</span><span>{insight.products.title}</span><span>·</span><time>{new Date(insight.created_at).toLocaleDateString()}</time>
                     </div>
-                  )}
-                </div>
+                    <h2 className="font-serif text-2xl md:text-3xl leading-tight">{insight.headline}</h2>
+                    <p className="text-sm text-[var(--muted)] leading-relaxed mt-4 max-w-2xl">{insight.justification}</p>
 
-                {insight.insight_type === 'seo_optimization' && (
-                  <div className="bg-[#0c0c0c] rounded-lg border border-blue-900/30 p-5 space-y-2">
-                    <p className="text-[10px] font-mono text-blue-400/60 uppercase tracking-wider flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse inline-block" />
-                      {t.googlePreview}
-                    </p>
-                    <div className="font-sans space-y-1 max-w-xl">
-                      <span className="text-xs text-[#bdc1c6] block truncate">
-                        https://swissglow.ch › products › {insight.products?.sku?.toLowerCase()}
-                      </span>
-                      <h4 className="text-lg text-[#8ab4f8] hover:underline cursor-pointer font-medium leading-tight">
-                        {insight.proposed_data.seo_title || insight.products?.title}
-                      </h4>
-                      <p className="text-xs text-[#bdc1c6] leading-relaxed line-clamp-2 font-light">
-                        {insight.proposed_data.seo_description || '—'}
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                <div className="border-t border-[#daffde]/5 pt-4 flex flex-col sm:flex-row justify-between items-center gap-4">
-                  <div className="flex items-center gap-4 text-xs font-mono text-[#daffde]/50 w-full sm:w-auto">
-                    <span>
-                      {t.product}:{' '}
-                      <strong className="text-[#f5f5f5]">{insight.products?.title}</strong>
-                    </span>
-                    <span>•</span>
-                    <span>
-                      SKU: <strong className="text-[#deff9a]">{insight.products?.sku}</strong>
-                    </span>
-                  </div>
-                  <div className="flex gap-2 w-full sm:w-auto">
-                    {!isAdmin ? (
-                      <span className="text-xs font-mono text-amber-400 bg-amber-950/40 border border-amber-900/60 px-3 py-2 rounded font-bold uppercase tracking-wider">
-                        🔒 {locale === 'de' ? 'Nur Lesezugriff — Admin erforderlich' : locale === 'en' ? 'Read Only — Admin Role Required' : 'Modo Lectura — Requiere Rol Admin'}
-                      </span>
-                    ) : (
-                      <>
-                        <button
-                          onClick={() => handleDismiss(insight.id)}
-                          disabled={actioningId !== null}
-                          className="flex-1 sm:flex-none px-4 py-2 rounded bg-transparent border border-red-900 text-red-400 hover:bg-red-950/30 text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-                        >
-                          {t.dismiss}
-                        </button>
-                        <button
-                          onClick={() => handleApprove(insight)}
-                          disabled={actioningId !== null}
-                          className="flex-1 sm:flex-none px-4 py-2 rounded bg-[#deff9a] text-[#000000] hover:bg-[#000000] hover:text-[#deff9a] border border-[#deff9a] text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-                        >
-                          {actioningId === insight.id ? t.applying : t.approve}
-                        </button>
-                      </>
+                    {insight.insight_type === 'dynamic_pricing' && (
+                      <div className="mt-6 flex items-baseline gap-4"><span className="aura-label text-[var(--muted)]">Actual {insight.products.current_price.toFixed(2)}</span><span className="text-3xl font-serif text-[var(--cobalt)]">→ {insight.proposed_data.suggested_price?.toFixed(2)} CHF</span></div>
+                    )}
+                    {insight.insight_type === 'seo_optimization' && (
+                      <div className="mt-6 border-l-2 border-[var(--pine)] pl-4"><p className="text-xs text-[var(--pine)]">swissglow.ch / {insight.products.sku.toLowerCase()}</p><p className="text-lg text-[#183e9a] mt-1">{insight.proposed_data.seo_title || insight.products.title}</p><p className="text-sm text-[var(--muted)] mt-1">{insight.proposed_data.seo_description || 'Sin descripción propuesta'}</p></div>
                     )}
                   </div>
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
+                  <div className="border-t lg:border-t-0 lg:border-l border-[var(--line)] p-6 flex lg:flex-col justify-end gap-3 bg-[var(--paper)]">
+                    {isAdmin ? <>
+                      <button disabled={actioningId !== null} onClick={() => decide(insight, 'apply')} className="aura-button-primary flex-1 lg:flex-none">{actioningId === insight.id ? 'Aplicando…' : t.approve}</button>
+                      <button disabled={actioningId !== null} onClick={() => decide(insight, 'dismiss')} className="aura-button-secondary flex-1 lg:flex-none">{t.dismiss}</button>
+                    </> : <p className="text-sm text-[var(--muted)]">Solo un administrador puede decidir.</p>}
+                  </div>
+                </article>
+              );
+            })}
+          </section>
+        )}
+      </main>
 
       {restockModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-          <div className="bg-[#111] border border-[#daffde]/20 rounded-2xl p-8 w-full max-w-md shadow-2xl space-y-6">
-            <div className="space-y-1">
-              <h2 className="text-lg font-bold text-[#f5f5f5]">Reponer Stock</h2>
-              <p className="text-sm text-[#daffde]/60">
-                <span className="text-[#deff9a] font-mono">{restockModal.insight.products.title}</span>
-                {' · '}Stock actual:{' '}
-                <span className="text-[#f5f5f5] font-mono">{restockModal.insight.products.stock_quantity} uds.</span>
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-xs font-mono text-[#daffde]/50 uppercase tracking-widest">
-                Unidades a añadir
-              </label>
-              <input
-                type="number"
-                min="1"
-                autoFocus
-                value={restockModal.qty}
-                onChange={(e) => setRestockModal((m) => m ? { ...m, qty: e.target.value } : null)}
-                onKeyDown={(e) => e.key === 'Enter' && handleRestockConfirm()}
-                className="w-full bg-[#0a0a0a] border border-[#daffde]/20 rounded-lg px-4 py-3 text-[#f5f5f5] font-mono text-xl focus:outline-none focus:border-[#deff9a]/60 transition-colors"
-                placeholder="0"
-              />
-              {restockModal.qty && parseInt(restockModal.qty, 10) > 0 && (
-                <p className="text-xs text-[#daffde]/40 font-mono">
-                  Nuevo stock: {restockModal.insight.products.stock_quantity + parseInt(restockModal.qty, 10)} uds.
-                </p>
-              )}
-            </div>
-
-            <div className="flex gap-3">
-              <button
-                onClick={() => setRestockModal(null)}
-                className="flex-1 px-4 py-2.5 rounded-lg border border-[#daffde]/20 text-[#daffde]/60 hover:bg-[#daffde]/5 text-xs font-bold uppercase tracking-wider transition-all"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={handleRestockConfirm}
-                disabled={!restockModal.qty || parseInt(restockModal.qty, 10) <= 0}
-                className="flex-1 px-4 py-2.5 rounded-lg bg-[#deff9a] text-black hover:bg-[#000] hover:text-[#deff9a] border border-[#deff9a] text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                Confirmar Reposición
-              </button>
-            </div>
+        <div className="fixed inset-0 z-[100] bg-[rgba(19,33,28,.55)] backdrop-blur-sm grid place-items-center p-4" role="dialog" aria-modal="true" aria-labelledby="restock-title">
+          <div className="aura-panel w-full max-w-md p-7 md:p-9 aura-enter">
+            <p className="aura-label text-[var(--signal)]">Reposición de stock</p>
+            <h2 id="restock-title" className="font-serif text-3xl mt-3">¿Cuántas unidades entran?</h2>
+            <p className="text-sm text-[var(--muted)] mt-3">{restockModal.insight.products.title} · actual {restockModal.insight.products.stock_quantity}</p>
+            <input autoFocus type="number" min="1" value={restockModal.qty} onChange={(event) => setRestockModal({ ...restockModal, qty: event.target.value })} className="aura-input mt-6 text-2xl font-mono" placeholder="0" />
+            <div className="flex gap-3 mt-6"><button onClick={() => setRestockModal(null)} className="aura-button-secondary flex-1">Cancelar</button><button onClick={confirmRestock} disabled={!restockModal.qty || Number(restockModal.qty) <= 0} className="aura-button-primary flex-1 disabled:opacity-40">Confirmar</button></div>
           </div>
         </div>
       )}

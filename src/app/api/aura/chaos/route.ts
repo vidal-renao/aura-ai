@@ -1,12 +1,23 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
+import { authErrorResponse, requireSameOrigin, requireUser } from '@/utils/auth/server';
 
 const ChaosSchema = z.object({
   mode: z.enum(['timeout', 'api_down', 'corrupt']),
-  role: z.string().optional().default('Admin'),
 });
 
 export async function POST(req: Request) {
+  try {
+    requireSameOrigin(req);
+    await requireUser('Admin');
+  } catch (error: unknown) {
+    return authErrorResponse(error) ?? NextResponse.json({ error: 'Authorization failed' }, { status: 500 });
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    return NextResponse.json({ error: 'Chaos mode is disabled in production' }, { status: 403 });
+  }
+
   let body: unknown;
 
   try {
@@ -24,14 +35,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const { mode, role } = parse.data;
-
-  if (role !== 'Admin') {
-    return NextResponse.json(
-      { error: 'CHAOS:DENIED — Admin role required for fault injection.' },
-      { status: 403 }
-    );
-  }
+  const { mode } = parse.data;
 
   if (mode === 'timeout') {
     // Force 20s delay — intentionally exceeds Vercel gateway limit (10s hobby / 60s pro)

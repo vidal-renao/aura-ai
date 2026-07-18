@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from 'react';
 import { createAuraClient } from '@/utils/supabase/client';
 import Navigation from '@/components/Navigation';
 import { dictionaries, Locale } from '@/utils/i18n/dictionaries';
-import { getSessionContext } from '@/utils/auth/mockAuth';
+import { getClientSessionContext } from '@/utils/auth/client';
 
 const supabase = createAuraClient();
 
@@ -61,11 +61,11 @@ export default function InventoryPage() {
   }, [products]);
 
   const fetchInventoryAndLogs = async () => {
-    const { app_metadata: { tenant_id } } = getSessionContext();
+    const { tenantId } = await getClientSessionContext();
     const { data: prodData } = await supabase
       .from('products')
       .select('*')
-      .eq('tenant_id', tenant_id);
+      .eq('tenant_id', tenantId);
 
     if (prodData) setProducts(prodData);
 
@@ -86,63 +86,52 @@ export default function InventoryPage() {
       setLoading(true);
       await fetchInventoryAndLogs();
       setLocale((localStorage.getItem('aura_locale') as Locale) || 'es');
-      setIsAdmin(getSessionContext().role === 'Admin');
+      const context = await getClientSessionContext();
+      setIsAdmin(context.role === 'Admin');
       setLoading(false);
     };
     initData();
 
     const handleLocale = () =>
       setLocale((localStorage.getItem('aura_locale') as Locale) || 'es');
-    const handleRole = () => setIsAdmin(getSessionContext().role === 'Admin');
 
     window.addEventListener('localeChange', handleLocale);
-    window.addEventListener('roleChange', handleRole);
 
     return () => {
       window.removeEventListener('localeChange', handleLocale);
-      window.removeEventListener('roleChange', handleRole);
     };
   }, []);
 
   // WebSocket Realtime
   useEffect(() => {
-    const { app_metadata: { tenant_id } } = getSessionContext();
-    const productChannel = supabase
-      .channel('realtime-inventory')
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'aura_core',
-          table: 'products',
-          filter: `tenant_id=eq.${tenant_id}`,
-        },
-        (payload) => {
-          const oldProd = productsRef.current.find((p) => p.id === payload.new.id);
-          const newProd = payload.new as Product;
+    let active = true;
+    let productChannel: ReturnType<typeof supabase.channel> | null = null;
 
+    getClientSessionContext().then(({ tenantId }) => {
+      if (!active) return;
+      productChannel = supabase.channel('realtime-inventory').on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'aura_core', table: 'products', filter: `tenant_id=eq.${tenantId}` },
+        (payload) => {
+          const oldProd = productsRef.current.find((product) => product.id === payload.new.id);
+          const newProd = payload.new as Product;
           if (oldProd) {
             setFlashType(newProd.current_price >= oldProd.current_price ? 'up' : 'down');
             setFlashingProductId(newProd.id);
             setTimeout(() => setFlashingProductId(null), 1500);
           }
-
-          setProducts((prev) => prev.map((p) => (p.id === newProd.id ? newProd : p)));
-
-          supabase
-            .from('pricing_logs')
-            .select('*')
-            .in('product_id', productsRef.current.map((p) => p.id))
+          setProducts((previous) => previous.map((product) => product.id === newProd.id ? newProd : product));
+          supabase.from('pricing_logs').select('*')
+            .in('product_id', productsRef.current.map((product) => product.id))
             .order('created_at', { ascending: false })
-            .then(({ data }) => {
-              if (data) setLogs(data);
-            });
+            .then(({ data }) => { if (data) setLogs(data); });
         }
-      )
-      .subscribe();
+      ).subscribe();
+    });
 
     return () => {
-      supabase.removeChannel(productChannel);
+      active = false;
+      if (productChannel) supabase.removeChannel(productChannel);
     };
   }, []);
 
@@ -231,7 +220,7 @@ export default function InventoryPage() {
       if (!result.success) throw new Error(result.error);
 
       startJobPolling(result.job_id);
-    } catch (err: any) {
+    } catch (err: unknown) {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
         pollIntervalRef.current = null;
@@ -239,7 +228,7 @@ export default function InventoryPage() {
       setIsRunningAI(false);
       setProgress(0);
       setIsEdgeHealthy(false);
-      setTelemetryMessage(`Fallo en Gateway: ${err.message}`);
+      setTelemetryMessage(`Fallo en Gateway: ${err instanceof Error ? err.message : 'Error desconocido'}`);
     }
   };
 
@@ -261,7 +250,7 @@ export default function InventoryPage() {
       if (!result.success) throw new Error(result.error);
 
       startJobPolling(result.job_id, mode);
-    } catch (err: any) {
+    } catch (err: unknown) {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
         pollIntervalRef.current = null;
@@ -270,7 +259,7 @@ export default function InventoryPage() {
       setActiveChaosMode(null);
       setProgress(0);
       setIsEdgeHealthy(false);
-      setTelemetryMessage(`[CHAOS:${mode.toUpperCase()}] Gateway fault: ${err.message}`);
+      setTelemetryMessage(`[CHAOS:${mode.toUpperCase()}] Gateway fault: ${err instanceof Error ? err.message : 'Error desconocido'}`);
     }
   };
 
@@ -317,23 +306,24 @@ export default function InventoryPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-[#000000] text-[#f5f5f5] flex items-center justify-center font-sans">
-        <p className="text-[#deff9a] text-xl animate-pulse tracking-wide">{t.loading}</p>
+      <div className="aura-page aura-data-grid flex items-center justify-center">
+        <p className="aura-label text-[var(--cobalt)] animate-pulse">{t.loading}</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#000000] text-[#f5f5f5] font-sans">
+    <div className="aura-page aura-console">
       <Navigation />
 
-      <div className="max-w-7xl mx-auto p-8 space-y-10">
+      <div className="aura-wrap py-10 md:py-14 space-y-10">
 
         {/* Cabecera + disparador de IA */}
-        <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-[#daffde]/20 pb-6 gap-4">
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-end border-b border-[var(--ink)] pb-8 gap-6 aura-enter">
           <div>
-            <h1 className="text-4xl font-black tracking-tight text-[#f5f5f5]">
-              {t.title} <span className="text-[#deff9a]">{t.span}</span>
+            <p className="aura-label text-[var(--cobalt)] mb-3">Catalog intelligence · {products.length} SKU</p>
+            <h1 className="aura-display text-5xl md:text-7xl">
+              {t.title} <em className="text-[var(--cobalt)]">{t.span}</em>
             </h1>
             <p className="text-[#daffde]/70 text-sm mt-1">
               Tenant: SwissGlow Tech — Sector: Premium Health &amp; Ergonomics
@@ -354,10 +344,10 @@ export default function InventoryPage() {
               <button
                 onClick={handleTriggerAI}
                 disabled={isRunningAI}
-                className={`w-full md:w-auto px-6 py-3 rounded-lg font-bold text-sm tracking-wider uppercase transition-all duration-300 border ${
+                className={`w-full md:w-auto aura-button-primary ${
                   isRunningAI
-                    ? 'bg-[#1a1a1a] text-[#daffde]/40 border-[#daffde]/10 cursor-not-allowed'
-                    : 'bg-[#deff9a] text-[#000000] border-[#deff9a] hover:bg-[#000000] hover:text-[#deff9a] shadow-[0_0_15px_rgba(222,255,154,0.15)]'
+                    ? 'opacity-40 cursor-not-allowed'
+                    : ''
                 }`}
               >
                 {isRunningAI && !activeChaosMode ? t.processing : t.trigger}

@@ -5,8 +5,8 @@
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-4.0-38B2AC?style=for-the-badge&logo=tailwind-css&logoColor=white)](https://tailwindcss.com)
 [![Supabase](https://img.shields.io/badge/Supabase-aura__core-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white)](https://supabase.com)
 [![Anthropic](https://img.shields.io/badge/Anthropic-claude--sonnet--4--6-756254?style=for-the-badge)](https://anthropic.com)
-[![Swiss DSG](https://img.shields.io/badge/Swiss_DSG-Compliant-D52B1E?style=for-the-badge)](https://www.fedlex.admin.ch)
-[![GDPR](https://img.shields.io/badge/GDPR-Compliant-003399?style=for-the-badge)](https://gdpr.eu)
+[![Swiss DSG](https://img.shields.io/badge/Swiss_DSG-Controls_Implemented-D52B1E?style=for-the-badge)](https://www.fedlex.admin.ch)
+[![GDPR](https://img.shields.io/badge/GDPR-Assessment_Required-003399?style=for-the-badge)](https://gdpr.eu)
 
 ---
 
@@ -46,7 +46,7 @@
 | `ai_insights` | AI-generated recommendations (`pending` / `applied` / `dismissed`) |
 | `pricing_logs` | Immutable audit log of all approved price changes |
 
-**Security model:** RLS enabled on all tables. Anon key reads via explicit policies. Service role bypasses RLS but requires explicit PostgreSQL GRANTs (`GRANT USAGE ON SCHEMA`, `GRANT SELECT/INSERT/UPDATE/DELETE ON ALL TABLES`).
+**Security model:** RLS limits authenticated reads by the trusted `app_metadata.tenant_id` claim. Privileged mutations run only through authenticated server routes; the service-role key is never exposed to the browser.
 
 ---
 
@@ -83,8 +83,9 @@ POST /api/aura/engine { tenant_id }
 ## Local Development
 
 ```bash
-npm install
+npm ci
 npm run dev
+npm run verify
 ```
 
 **Required environment variables:**
@@ -92,8 +93,15 @@ npm run dev
 ```env
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
+NEXT_PUBLIC_SITE_URL=http://localhost:3000
 SUPABASE_SERVICE_ROLE_KEY=
 ANTHROPIC_API_KEY=
+```
+
+Apply migrations in `supabase/migrations/` in timestamp order. Every Supabase Auth user must receive server-controlled metadata such as:
+
+```json
+{ "tenant_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d", "role": "Admin" }
 ```
 
 ---
@@ -111,9 +119,9 @@ ANTHROPIC_API_KEY=
 
 | Regulation | Status | Mechanism |
 | :--- | :--- | :--- |
-| Swiss DSG (nDSG) | Compliant | Schema isolation, RLS, pricing audit logs |
-| GDPR / EU 2016/679 | Compliant | Data minimization, immutable audit trail |
-| Data Residency | EU/CH | Supabase region: `eu-central-1` |
+| Swiss DSG (nDSG) | Technical controls implemented | Schema isolation, RLS, pricing audit logs |
+| GDPR / EU 2016/679 | Legal assessment required | Data minimization and audit mechanisms available |
+| Data Residency | Deployment-dependent | Verify the configured Supabase and Vercel regions |
 
 ---
 

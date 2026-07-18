@@ -1,8 +1,11 @@
-import { NextResponse } from 'next/server';
+import { after, NextResponse } from 'next/server';
 import { createAuraServerClient } from '@/utils/supabase/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
-import { getSessionContext } from '@/utils/auth/mockAuth';
+import { authErrorResponse, requireSameOrigin, requireUser } from '@/utils/auth/server';
+import { AgentBatchResponseSchema } from '@/types/ai';
+
+export const maxDuration = 60;
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -13,15 +16,30 @@ const RequestSchema = z.object({
   chaos_mode: z.enum(['timeout', 'api_down', 'corrupt']).optional(),
 });
 
+interface ProductRow {
+  id: string;
+  sku: string;
+  title: string;
+  description: string | null;
+  cost_price: number;
+  current_price: number;
+  stock_quantity: number;
+  min_stock_alert: number;
+}
+
+const errorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : 'Unknown processing error';
+
 export async function POST(req: Request) {
   const supabase = createAuraServerClient();
   const startTime = Date.now();
 
   try {
-    const userSession = getSessionContext();
-    const tenant_id = userSession.app_metadata.tenant_id;
+    requireSameOrigin(req);
+    const userSession = await requireUser('Admin');
+    const tenant_id = userSession.tenantId;
 
-    const body = await req.json();
+    const body: unknown = await req.json().catch(() => null);
     const parseCheck = RequestSchema.safeParse(body);
 
     if (!parseCheck.success) {
@@ -29,6 +47,26 @@ export async function POST(req: Request) {
     }
 
     const { locale, chaos_mode } = parseCheck.data;
+
+    if (chaos_mode && process.env.NODE_ENV === 'production') {
+      return NextResponse.json({ error: 'Chaos mode is disabled in production' }, { status: 403 });
+    }
+
+    const { data: rateLimitAllowed, error: rateLimitError } = await supabase.rpc(
+      'consume_rate_limit',
+      { p_key: `engine:${tenant_id}`, p_limit: 3, p_window_seconds: 60 }
+    );
+
+    if (rateLimitError) {
+      console.error('Rate limiter unavailable:', rateLimitError.code);
+      return NextResponse.json({ error: 'Rate limiter unavailable' }, { status: 503 });
+    }
+    if (!rateLimitAllowed) {
+      return NextResponse.json(
+        { error: 'Rate limit exceeded. Try again in one minute.' },
+        { status: 429, headers: { 'Retry-After': '60' } }
+      );
+    }
 
     const initStatusText = chaos_mode
       ? `[CHAOS:${chaos_mode.toUpperCase()}] Inicializando inyección de fallo controlado en pipeline...`
@@ -51,7 +89,7 @@ export async function POST(req: Request) {
     }
 
     // Hilo analítico asíncrono con observabilidad LLM nativa y soporte Chaos Engineering
-    (async () => {
+    after(async () => {
       const jobId = job.id;
       try {
         // 🔍 FILTRO PRE-ALGORÍTMICO FINOPS
@@ -72,8 +110,9 @@ export async function POST(req: Request) {
           throw new Error('Contexto corporativo incompleto: productos o tenant ausentes.');
         }
 
-        const anomalousProducts = allProducts.filter(
-          (p: any) => p.stock_quantity <= p.min_stock_alert || p.current_price <= p.cost_price
+        const products = allProducts as ProductRow[];
+        const anomalousProducts = products.filter(
+          (product) => product.stock_quantity <= product.min_stock_alert || product.current_price <= product.cost_price
         );
 
         const totalSKUs = totalCount ?? allProducts.length;
@@ -142,7 +181,7 @@ export async function POST(req: Request) {
           return;
         }
 
-        const productIds = anomalousProducts.map((p: any) => p.id);
+        const productIds = anomalousProducts.map((product) => product.id);
         const { data: salesHistory } = await supabase
           .from('sales_history')
           .select('*')
@@ -180,7 +219,7 @@ export async function POST(req: Request) {
           messages: [
             {
               role: 'user',
-              content: `Catálogo crítico: ${JSON.stringify(anomalousProducts)}. Series temporales: ${JSON.stringify(salesHistory || [])}`,
+              content: `Catálogo crítico: ${JSON.stringify(anomalousProducts.map(({ id, sku, title, description, cost_price, current_price, stock_quantity, min_stock_alert }) => ({ id, sku, title, description, cost_price, current_price, stock_quantity, min_stock_alert })))}. Series temporales: ${JSON.stringify(salesHistory || [])}`,
             },
           ],
           tools: [
@@ -232,12 +271,19 @@ export async function POST(req: Request) {
           );
         }
 
-        const rawInsights = (toolBlock.input as any).insights || [];
+        const parsedInsights = AgentBatchResponseSchema.safeParse(toolBlock.input);
+        if (!parsedInsights.success) {
+          throw new Error(`Invalid structured AI response: ${parsedInsights.error.issues[0]?.message ?? 'schema mismatch'}`);
+        }
 
-        const bulkPayload = rawInsights
-          .map((insight: any) => {
-            const match = anomalousProducts.find((p: any) => p.sku === insight.sku);
+        const bulkPayload = parsedInsights.data.insights
+          .map((insight) => {
+            const match = anomalousProducts.find((product) => product.sku === insight.sku);
             if (!match) return null;
+            const suggestedPrice = insight.proposed_data.suggested_price;
+            if (suggestedPrice !== null && (
+              suggestedPrice < match.cost_price || suggestedPrice > match.current_price * 2
+            )) return null;
             return {
               tenant_id,
               product_id: match.id,
@@ -248,7 +294,7 @@ export async function POST(req: Request) {
               status: 'pending',
             };
           })
-          .filter(Boolean);
+          .filter((payload): payload is NonNullable<typeof payload> => payload !== null);
 
         if (bulkPayload.length > 0) {
           const { error: insertErr } = await supabase.from('ai_insights').insert(bulkPayload);
@@ -266,12 +312,13 @@ export async function POST(req: Request) {
             processed_count: bulkPayload.length,
           })
           .eq('id', jobId);
-      } catch (innerError: any) {
-        const isChaos = innerError.message?.startsWith('[CHAOS:');
+      } catch (innerError: unknown) {
+        const message = errorMessage(innerError);
+        const isChaos = message.startsWith('[CHAOS:');
         console.error(
           isChaos ? '☣️ [CHAOS ENGINEERING]' : '⚠️ [OBSERVABILIDAD LLM]',
           'Error en segundo plano:',
-          innerError.message
+          message
         );
         await supabase
           .from('agent_jobs')
@@ -280,15 +327,18 @@ export async function POST(req: Request) {
             status_text: isChaos
               ? `Fallo controlado inyectado. Resiliencia del pipeline validada.`
               : 'Fallo en la canalización analítica de la IA.',
-            error_message: `${innerError.message} | Latencia total: ${((Date.now() - startTime) / 1000).toFixed(2)}s`,
+            error_message: `${message} | Latencia total: ${((Date.now() - startTime) / 1000).toFixed(2)}s`,
             progress: 100,
           })
           .eq('id', jobId);
       }
-    })();
+    });
 
     return NextResponse.json({ success: true, job_id: job.id });
-  } catch (error: any) {
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  } catch (error: unknown) {
+    const authResponse = authErrorResponse(error);
+    if (authResponse) return authResponse;
+    console.error('Engine request failed:', errorMessage(error));
+    return NextResponse.json({ success: false, error: 'Unable to start analytics job' }, { status: 500 });
   }
 }
